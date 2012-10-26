@@ -52,11 +52,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
     const DEFAULT_STATUS = true;
     const DEFAULT_FAILURE_CALLBACK = null;
 
-    /**
-     * Log message
-     */
-    const TAGS_UNSUPPORTED_BY_CLEAN_OF_MEMCACHED_BACKEND = 'Zend_Cache_Backend_Memcached::clean() : tags are unsupported by the Memcached backend';
-    const TAGS_UNSUPPORTED_BY_SAVE_OF_MEMCACHED_BACKEND =  'Zend_Cache_Backend_Memcached::save() : tags are unsupported by the Memcached backend';
+    /* used to control auto cache flushing, we can increment this number up and
+     * any record retrieved with a lower number will automatically be rejected */
+    const CACHE_OBJECT_VERSION = 1;
 
     /**
      * Available options
@@ -97,7 +95,7 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
     /**
      * Memcache object
      *
-     * @var mixed memcache object
+     * @var Shanty_Mongo_Collection Shanty Mongo Collection object
      */
     protected $_connection = null;
 
@@ -118,7 +116,8 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
         if(!$this->_options['collection'])
             die('you must set a collection');
 
-        Shanty_Mongo_Collection::getConnection(true)->selectDB('othernet')->selectCollection('zend_cache');
+        $this->_options['write_control'] = false;
+
         $this->_connection = Shanty_Mongo_Collection::getConnection(true)
                 ->selectDB($this->_options['db'])
                 ->selectCollection($this->_options['collection']);
@@ -131,8 +130,10 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      * @param  boolean $doNotTestCacheValidity If set to true, the cache validity won't be tested
      * @return string|false cached datas
      */
-    public function load($id, $doNotTestCacheValidity = false)
+    public function load($id, $doNotTestCacheValidity = false, $doNotUnserialize = false)
     {
+        $this->_lastId = $id;
+
         $tmp = $this->_connection->findOne(
             array(
                  'cache_id' => $id
@@ -140,16 +141,37 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
         );
 
         if (
-            !isset($tmp['lifetime'])
-            || (
-                $tmp
-                && isset($tmp['lifetime'])
-                && (time() < $tmp['date_added'] + $tmp['lifetime'] || $doNotTestCacheValidity)
+            $tmp
+            && isset($tmp['object_version'])
+            && $tmp['object_version'] == static::CACHE_OBJECT_VERSION
+            && (
+                $doNotTestCacheValidity
+                || (isset($tmp['ttl']) && time() < $tmp['ttl'])
+                || (!isset($tmp['ttl']) && time() < $tmp['date_added'] + $tmp['lifetime'])
             )
         )
         {
+            /* increment the hit counter */
+            $this->_connection->update(
+                array(
+                    'cache_id' => $id
+                ),
+                array(
+                    '$inc' => array(
+                        'hits' => 1
+                    )
+                ),
+                array(
+                    'upsert' => false,
+                    'multiple' => false
+                )
+            );
+
             return $tmp['data'];
         }
+        else if($tmp)
+            $this->remove($id);
+
 
         return false;
     }
@@ -188,9 +210,17 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function save($data, $id, $tags = array(), $specificLifetime = false)
     {
+        if($id === null)
+            $id = $this->_lastId;
+
         $lifetime = $this->getLifetime($specificLifetime);
 
-        $cachedItem = $this->_connection->findOne(array('cache_id' => $id));
+        if($lifetime > time())
+            $lifetime = $lifetime - time();
+
+        $cachedItem = $this->_connection->findOne(
+            array('cache_id' => $id)
+        );
 
         if($cachedItem)
         {
@@ -208,10 +238,10 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
             $cachedItem['data'] = $data;
             $cachedItem['date_added'] = time();
             $cachedItem['lifetime'] = $lifetime;
+            $cachedItem['ttl'] = $cachedItem['date_added'] + $lifetime;
             $cachedItem['tags'] = $tags;
-
+            $cachedItem['object_version'] = static::CACHE_OBJECT_VERSION;
             $cachedItem->save();
-            return true;
         }
         else
         {
@@ -221,6 +251,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
                     'data' => $data,
                     'date_added' => time(),
                     'lifetime' => $lifetime,
+                    'ttl' => time() + $lifetime,
+                    'hits' => 0,
+                    'object_version' => static::CACHE_OBJECT_VERSION,
                     'tags' => $tags
                 ),
                 array(
@@ -233,9 +266,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
             );
 
             $newDoc->save();
-
-            return true;
         }
+
+        return true;
     }
 
     /**
@@ -246,7 +279,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function remove($id)
     {
-        return $this->_connection->remove(array('cache_id' => $id));
+        return $this->_connection->remove(
+            array('cache_id' => $id)
+        );
     }
 
     /**
@@ -283,12 +318,16 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
                     if(time() >= $item['date_added'] + $item['lifetime'])
                        $this->_connection->remove(array('_id' => new MongoId($item['_id'])));
 
-
                 break;
             case Zend_Cache::CLEANING_MODE_MATCHING_TAG:
+                if(!is_array($tags))
+                    $tags = array($tags);
+
                 $result = $this->_connection->find(
                     array(
-                        'tags' => array('$all' => $tags)
+                        'tags' => array(
+                            '$all' => $tags
+                        )
                     )
                 );
 
@@ -297,9 +336,14 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
 
                 break;
             case Zend_Cache::CLEANING_MODE_NOT_MATCHING_TAG:
+                if(!is_array($tags))
+                    $tags = array($tags);
+
                 $result = $this->_connection->find(
                     array(
-                        'tags' => array('$nin' => $tags)
+                        'tags' => array(
+                            '$nin' => $tags
+                        )
                     )
                 );
 
@@ -308,9 +352,14 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
 
                 break;
             case Zend_Cache::CLEANING_MODE_MATCHING_ANY_TAG:
+                if(!is_array($tags))
+                    $tags = array($tags);
+
                 $result = $this->_connection->find(
                     array(
-                        'tags' => array('$in' => $tags)
+                        'tags' => array(
+                            '$in' => $tags
+                        )
                     )
                 );
 
@@ -362,24 +411,16 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function getIds()
     {
-        $return = array();
         $result = $this->_connection->find(
             array(),
             array(
                 'cache_id',
-                'date_added',
-                'lifetime'
             )
         );
+
+        $return = array();
         foreach($result as $item)
-            if (
-                !isset($item['lifetime'])
-                || (
-                    isset($item['lifetime'])
-                    && time() < $item['date_added'] + $item['lifetime']
-                )
-            )
-                $return[] = $item['cache_id'];
+            $return[] = $item['cache_id'];
 
         return $return;
     }
@@ -391,17 +432,22 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function getTags()
     {
-        $return = array();
-        $result = $this->_connection->find(array(), array('tags', 'date_added', 'lifetime'));
-        foreach($result as $item)
-            if (
-                !isset($item['lifetime'])
-                || (
-                    isset($item['lifetime'])
-                    && time() < $item['date_added'] + $item['lifetime']
-                )
+        $result = $this->_connection->find(
+            array(),
+            array(
+                'tags',
+                'date_added',
+                'lifetime',
+                'tags'
             )
-                $return = array_merge($return, $item['tags']);
+        );
+
+        $return = array();
+        foreach($result as $item)
+            $return = array_merge($return, $item['tags']);
+
+        /* make sure it is a unique set of tags */
+        $return = array_unique($return);
 
         return $return;
     }
@@ -416,6 +462,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function getIdsMatchingTags($tags = array())
     {
+        if(!is_array($tags))
+            $tags = array($tags);
+
         $return = array();
         $result = $this->_connection->find(
             array(
@@ -424,20 +473,12 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
                 )
             ),
             array(
-                'cache_id',
-                'date_added',
-                'lifetime'
+                'cache_id'
             )
         );
+
         foreach($result as $item)
-            if (
-                !isset($item['lifetime'])
-                || (
-                    isset($item['lifetime'])
-                    && time() < $item['date_added'] + $item['lifetime']
-                )
-            )
-                $return[] = $item['cache_id'];
+            $return[] = $item['cache_id'];
 
         return $return;
     }
@@ -452,6 +493,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function getIdsNotMatchingTags($tags = array())
     {
+        if(!is_array($tags))
+            $tags = array($tags);
+
         $return = array();
         $result = $this->_connection->find(
             array(
@@ -461,19 +505,11 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
             ),
             array(
                 'cache_id',
-                'date_added',
-                'lifetime'
             )
         );
+
         foreach($result as $item)
-            if (
-                !isset($item['lifetime'])
-                || (
-                    isset($item['lifetime'])
-                    && time() < $item['date_added'] + $item['lifetime']
-                )
-            )
-                $return[] = $item['cache_id'];
+            $return[] = $item['cache_id'];
 
         return $return;
     }
@@ -488,6 +524,9 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
      */
     public function getIdsMatchingAnyTags($tags = array())
     {
+        if(!is_array($tags))
+            $tags = array($tags);
+
         $return = array();
         $result = $this->_connection->find(
             array(
@@ -497,19 +536,11 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
             ),
             array(
                 'cache_id',
-                'date_added',
-                'lifetime'
             )
         );
+
         foreach($result as $item)
-            if (
-                !isset($item['lifetime'])
-                || (
-                    isset($item['lifetime'])
-                    && time() < $item['date_added'] + $item['lifetime']
-                )
-            )
-                $return[] = $item['cache_id'];
+            $return[] = $item['cache_id'];
 
         return $return;
     }
@@ -589,6 +620,8 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
             else
                 $cachedItem['lifetime'] = $extraLifetime;
 
+            $cachedItem['ttl'] = $cachedItem['date_added'] + $cachedItem['lifetime'];
+
             $cachedItem->save();
             return true;
         }
@@ -600,8 +633,6 @@ class Shanty_Mongo_Cache extends Zend_Cache_Backend implements Zend_Cache_Backen
         if ($specificLifetime === false) {
             return $this->_directives['lifetime'];
         }
-
-        $specificLifetime = $specificLifetime - time();
 
         return $specificLifetime;
     }
